@@ -57,6 +57,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     TailKeyBoundary,
     TPShardedStoreLayout,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.host_staging import (  # noqa: E501
+    HostStagedStore,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
     LOOKUP_MSG,
     RESET_MSG,
@@ -67,6 +70,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import
 )
 from vllm.distributed.mooncake_store import MooncakeStoreConfig, setup_mooncake_store
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.utils.torch_utils import is_non_overlapping_and_dense
@@ -1512,6 +1516,9 @@ class MooncakeStoreWorker:
         self._mem_pool = self._create_mem_pool(extra_config, model_config)
 
         self.store = MooncakeDistributedStore()
+        if not current_platform.is_cuda_alike():
+            # Mooncake cannot address XPU device memory; stage through host RAM.
+            self.store = HostStagedStore(self.store)
         local_ip = get_ip()
         local_hostname = rdma_utils.get_requester_local_hostname(local_ip)
         setup_mooncake_store(self.store, store_config, local_hostname)
@@ -1884,7 +1891,10 @@ class MooncakeStoreWorker:
                     continue
                 seen_storage_ptrs.add(base_addr)
                 region_len = cache_storage.nbytes()
-                ret = self.store.register_buffer(base_addr, region_len)
+                if isinstance(self.store, HostStagedStore):
+                    ret = self.store.register_device_storage(cache_storage)
+                else:
+                    ret = self.store.register_buffer(base_addr, region_len)
                 if ret != 0:
                     logger.error(
                         "register_buffer failed for addr %#x len %d: %d",
@@ -2081,7 +2091,7 @@ class MooncakeStoreWorker:
         current_event = None
         for request in metadata.requests:
             if request.can_save:
-                current_event = torch.cuda.Event()
+                current_event = torch.Event()
                 current_event.record()
                 break
 
