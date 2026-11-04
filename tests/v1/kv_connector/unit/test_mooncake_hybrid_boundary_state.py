@@ -188,31 +188,24 @@ def test_decode_pod_hits_prompt_boundary_after_mooncake_receive():
     assert _decode_pod_hit(decoder, prompt, output_tokens) == 48
 
 
-def test_flag_off_sends_running_state_only():
-    prefiller = _make_scheduler("kv_producer", ssm_boundary_state_xfer=False)
-    decoder = _make_scheduler("kv_consumer", ssm_boundary_state_xfer=False)
-    prompt = _turn1_prompt(58)
-
-    _, sent = _run_prefill(prefiller, prompt)
-    received, output_tokens = _run_decode(decoder, prompt, "x-p-1", num_output=2)
-    assert len(_real(sent[MAMBA_GROUP])) == 1
-    assert len(_real(received)) == 1
-    assert _decode_pod_hit(decoder, prompt, output_tokens) == 0
-
-
-@pytest.mark.parametrize("p_xfer,d_xfer", [(True, False), (False, True)])
-def test_flag_mismatch_is_visible_in_block_counts(p_xfer, d_xfer):
-    """P and D cannot tell each other whether the flag is on. P extra is
-    dropped by the worker (it pairs P's trailing blocks); D extra makes P
-    report "P num blocks less than D" and the pull fails. Set it on both."""
+@pytest.mark.parametrize(
+    "p_xfer,d_xfer", [(False, False), (True, False), (False, True)]
+)
+def test_boundary_state_needs_flag_on_both_sides(p_xfer, d_xfer):
+    """Off by default. P and D cannot tell each other whether the flag is on:
+    P's extra block is dropped by the worker (it pairs P's trailing blocks),
+    while D's extra slot makes P report "P num blocks less than D" and the pull
+    fail. Either way the decode pod caches no boundary state."""
     prefiller = _make_scheduler("kv_producer", ssm_boundary_state_xfer=p_xfer)
     decoder = _make_scheduler("kv_consumer", ssm_boundary_state_xfer=d_xfer)
     prompt = _turn1_prompt(58)
 
     _, sent = _run_prefill(prefiller, prompt)
-    received, _ = _run_decode(decoder, prompt, "x-p-1", num_output=2)
+    received, output_tokens = _run_decode(decoder, prompt, "x-p-1", num_output=2)
     assert len(_real(sent[MAMBA_GROUP])) == 1 + p_xfer
     assert len(_real(received)) == 1 + d_xfer
+    if not d_xfer:
+        assert _decode_pod_hit(decoder, prompt, output_tokens) == 0
 
 
 def test_prompt_ending_on_boundary_sends_running_state_only():
