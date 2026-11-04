@@ -2515,6 +2515,59 @@ async def test_build_transfer_params_sends_packed_region_once(
     assert lengths == [n_blocks * block_len]
 
 
+@pytest.mark.asyncio
+async def test_build_transfer_params_addresses_above_int64():
+    """Intel XPU USM addresses start at 0xffff8...; the pointer math must not
+    overflow int64 ("Python int too large to convert to C long")."""
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.async_zmq_ctx = MagicMock()
+    worker.is_kv_consumer = True
+    worker.is_kv_producer = True
+    worker.tp_rank = 0
+    worker.tp_size = 1
+    worker.use_mla = True
+    worker.kv_cache_config = _make_packed_mla_kv_cache_config(
+        num_blocks=4, num_groups=1
+    )
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker.transfer_topo = SimpleNamespace(
+        local_replicates_kv_cache=False,
+        total_num_kv_heads=1,
+    )
+
+    block_len = 256
+    local_base, remote_base = 0xFFFF_80B0_7D40_0000, 0xFFFF_80B1_2F6C_0000
+    local_region, remote_region = (
+        _region(
+            base,
+            block_len=block_len,
+            row_offset=0,
+            layer_name="model.layers.0.mla_attn",
+            group_index=0,
+        )
+        for base in (local_base, remote_base)
+    )
+    send_meta = SendBlockMeta(
+        p_req_id="p-xpu",
+        transfer_id="xfer-xpu",
+        local_block_ids=[[10, 11]],
+        ready=asyncio.Event(),
+    )
+    xfer_meta = _xfer_meta([remote_region], {"d-xpu": ("xfer-xpu", [[20, 21]])})
+
+    src_ptrs, dst_ptrs, lengths, err_reqs, _ = await worker._build_transfer_params(
+        ready_reqs=[("d-xpu", send_meta)],
+        agent_meta=xfer_meta,
+        local_regions=[local_region],
+        remote_regions=[remote_region],
+    )
+
+    assert err_reqs == []
+    assert src_ptrs == [local_base + 10 * block_len]
+    assert dst_ptrs == [remote_base + 20 * block_len]
+    assert lengths == [2 * block_len]
+
+
 @pytest.mark.parametrize(
     ("src", "dst", "starts", "run_lens"),
     [
