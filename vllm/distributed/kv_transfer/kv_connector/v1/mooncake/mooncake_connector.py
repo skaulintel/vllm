@@ -100,7 +100,8 @@ except ImportError:
     TransferEngine = None
 
 if TYPE_CHECKING:
-    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -867,6 +868,11 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.build_connector_meta(scheduler_output)
 
+    def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
+        super().bind_kv_cache_manager(kv_cache_manager)
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.bind_kv_cache_manager(kv_cache_manager)
+
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
@@ -1017,6 +1023,44 @@ class MooncakeConnectorScheduler:
         )
         logger.info("Initializing Mooncake Transfer Engine Scheduler %s", engine_id)
 
+        # SSM boundary-state transfer (Mamba "align" mode), opt-in. P also
+        # sends the state at the last block boundary of the prompt so D caches
+        # it with the loaded prefix; a later turn sent to D alone then hits.
+        # The router gives P and D their params independently, so both sides
+        # derive the boundary from the prompt length alone.
+        self._align_ssm_groups: tuple[int, ...] = tuple(
+            i
+            for i, g in enumerate(kv_cache_config.transfer_groups)
+            if isinstance(g.kv_cache_spec, MambaSpec)
+            and g.kv_cache_spec.mamba_cache_mode == "align"
+        )
+        self._ssm_block_size = (
+            kv_cache_config.transfer_groups[
+                self._align_ssm_groups[0]
+            ].kv_cache_spec.block_size
+            if self._align_ssm_groups
+            else self.block_size
+        )
+        self._ssm_boundary_transfer = (
+            bool(
+                vllm_config.kv_transfer_config.get_from_extra_config(
+                    "ssm_boundary_state_xfer", False
+                )
+            )
+            and bool(self._align_ssm_groups)
+            and vllm_config.cache_config.enable_prefix_caching
+            and vllm_config.parallel_config.decode_context_parallel_size == 1
+        )
+        if self._ssm_boundary_transfer:
+            logger.info(
+                "Mooncake SSM boundary-state transfer on: groups %s, block size %d",
+                self._align_ssm_groups,
+                self._ssm_block_size,
+            )
+        self._kv_cache_manager: KVCacheManager | None = None
+        # P side: req -> (boundary tokens, pinned state block per align group).
+        self._boundary_pins: dict[ReqId, tuple[int, dict[int, KVCacheBlock]]] = {}
+
         self._is_hma_required = (
             not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
             and any(
@@ -1130,6 +1174,15 @@ class MooncakeConnectorScheduler:
             and (self._has_mamba or self._bounded_replay)
         ):
             self._truncate_mamba_request_for_prefill(request)
+        if (
+            self._ssm_boundary_transfer
+            and params is not None
+            and params.get("do_remote_decode")
+            and not self.is_kv_consumer
+        ):
+            boundary = self._ssm_boundary(request.num_prompt_tokens)
+            if boundary is not None:
+                self._boundary_pins[request.request_id] = (boundary, {})
 
         if (
             self._kv_lease_duration is not None
@@ -1146,10 +1199,120 @@ class MooncakeConnectorScheduler:
                 params["transfer_id"],
             )
 
+    def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
+        self._kv_cache_manager = kv_cache_manager
+
+    def _ssm_boundary(self, num_loaded_tokens: int) -> int | None:
+        """Tokens at the last block boundary strictly inside the loaded prefix,
+        or None when the running state already sits on a boundary. P and D
+        both call this with the N-1 tokens that P computes and D loads."""
+        boundary = num_loaded_tokens // self._ssm_block_size * self._ssm_block_size
+        return boundary if 0 < boundary < num_loaded_tokens else None
+
+    def _pin_boundary_states(self, scheduler_output: SchedulerOutput) -> None:
+        """P side: pin each producer request's boundary state when offered."""
+        block_state = scheduler_output.kv_connector_block_state
+        if block_state is None or self._kv_cache_manager is None:
+            return
+        pool = self._kv_cache_manager.block_pool
+        transfer_index = {
+            group_id: i
+            for i, group_id in enumerate(self.kv_cache_config.transfer_group_ids)
+        }
+        for req_id, entries in block_state.boundary_state_offloads.items():
+            if req_id not in self._boundary_pins:
+                continue
+            boundary, pins = self._boundary_pins[req_id]
+            for group_id, block_id, boundary_tokens in entries:
+                group = transfer_index.get(group_id)
+                if (
+                    boundary_tokens != boundary
+                    or group not in self._align_ssm_groups
+                    or group in pins
+                    or block_id == NULL_BLOCK_ID
+                ):
+                    continue
+                block = pool.blocks[block_id]
+                pool.touch([block])
+                pins[group] = block
+
+    def _pin_hit_boundary_states(
+        self, request: "Request", blocks: "KVCacheBlocks"
+    ) -> None:
+        """P side: a prefix hit that ends on the boundary computes no new
+        boundary state, so nothing is offered; pin the hit block instead."""
+        if (
+            request.request_id not in self._boundary_pins
+            or self._kv_cache_manager is None
+        ):
+            return
+        boundary, pins = self._boundary_pins[request.request_id]
+        boundary_idx = boundary // self._ssm_block_size - 1
+        group_ids = self.kv_cache_config.transfer_group_ids
+        for g in self._align_ssm_groups:
+            if g in pins:
+                continue
+            table = blocks.blocks[group_ids[g]]
+            if boundary_idx >= len(table):
+                continue
+            block = table[boundary_idx]
+            # Only an already-cached state at exactly this boundary qualifies;
+            # a freshly reserved checkpoint block has no hash yet.
+            if (
+                block.is_null
+                or block.block_hash is None
+                or block.block_hash_num_tokens != boundary
+            ):
+                continue
+            self._kv_cache_manager.block_pool.touch([block])
+            pins[g] = block
+
+    def _release_boundary_pins(self, req_id: ReqId) -> None:
+        _, pins = self._boundary_pins.pop(req_id, (0, {}))
+        if pins and self._kv_cache_manager is not None:
+            self._kv_cache_manager.block_pool.free_blocks(list(pins.values()))
+
+    def _attach_boundary_states(
+        self, request: "Request", block_ids: list[list[int]]
+    ) -> list[list[int]]:
+        """P side: put each align group's boundary state just before its
+        running state. The worker drops null blocks and pairs P's last n real
+        blocks with D's n, so D reserving no slot is harmless. If P has no
+        boundary state, D's extra slot makes the pull fail loudly ("P num
+        blocks less than D") instead of caching a wrong state."""
+        boundary, pins = self._boundary_pins.get(request.request_id, (0, {}))
+        if not boundary:
+            return block_ids
+        boundary_idx = boundary // self._ssm_block_size - 1
+        out = [list(g) for g in block_ids]
+        for g in self._align_ssm_groups:
+            blocks = out[g]
+            real = [i for i, b in enumerate(blocks) if b != NULL_BLOCK_ID]
+            if not real:
+                continue
+            if len(real) >= 2 and real[-2] == boundary_idx:
+                continue  # P's own table still holds it, already in place
+            if g not in pins:
+                logger.warning(
+                    "No boundary state for %s group %d at %d tokens; "
+                    "a decoder expecting it will fail this pull",
+                    request.request_id,
+                    g,
+                    boundary,
+                )
+                continue
+            # The worker only uses the trailing real blocks; send exactly
+            # [boundary state, running state].
+            out[g] = [pins[g].block_id, blocks[real[-1]]]
+        return out
+
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         # Failed pulls are reported here too.
         for req_id in connector_output.finished_recving or ():
             self._lease_reqs.pop(req_id, None)
+        if self._ssm_boundary_transfer:
+            for req_id in connector_output.finished_sending or ():
+                self._release_boundary_pins(req_id)
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -1187,10 +1350,25 @@ class MooncakeConnectorScheduler:
                 num_computed_tokens
             )
             if count > 0:
+                self._maybe_reserve_boundary_state(
+                    request, count + num_computed_tokens, num_computed_tokens
+                )
                 return count, True
 
         # No remote prefill for this request.
         return 0, False
+
+    def _maybe_reserve_boundary_state(
+        self, request: "Request", num_loaded_tokens: int, num_computed_tokens: int
+    ) -> None:
+        """D side: reserve a block for the boundary state P sends, unless the
+        local prefix hit already covers it."""
+        if not self._ssm_boundary_transfer or self._kv_cache_manager is None:
+            return
+        boundary = self._ssm_boundary(num_loaded_tokens)
+        if boundary is None or num_computed_tokens >= boundary:
+            return
+        self._kv_cache_manager.reserve_external_boundary_blocks(request.request_id)
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -1244,6 +1422,8 @@ class MooncakeConnectorScheduler:
             else:
                 # Add an empty list to worker to create event.
                 self._reqs_need_send[request.request_id] = (request, [])
+            if self._ssm_boundary_transfer:
+                self._pin_hit_boundary_states(request, blocks)
 
     def build_connector_meta(
         self,
@@ -1278,6 +1458,9 @@ class MooncakeConnectorScheduler:
                             remote_bootstrap_addr=bootstrap_addr, transfer_ids=[]
                         )
                     heartbeat.transfer_ids.append(transfer_id)
+
+        if self._ssm_boundary_transfer and not self.is_kv_consumer:
+            self._pin_boundary_states(scheduler_output)
 
         if not self.is_kv_consumer:
             for req_id, (req, block_ids) in self._reqs_need_send.items():
@@ -1334,6 +1517,7 @@ class MooncakeConnectorScheduler:
         if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
             # Also include the case of a P/D Prefill request with immediate
             # block free (eg abort). Stop tracking this request.
+            self._release_boundary_pins(request.request_id)
             self._reqs_not_processed.add(params["transfer_id"])
             return False, None
 
@@ -1342,10 +1526,12 @@ class MooncakeConnectorScheduler:
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
 
         if delay_free_blocks:
-            self._reqs_need_send[request.request_id] = (
-                request,
-                self.get_sw_clipped_blocks(block_ids),
-            )
+            send_block_ids = self.get_sw_clipped_blocks(block_ids)
+            if self._ssm_boundary_transfer:
+                send_block_ids = self._attach_boundary_states(request, send_block_ids)
+            self._reqs_need_send[request.request_id] = (request, send_block_ids)
+        else:
+            self._release_boundary_pins(request.request_id)
 
         return delay_free_blocks, None
 

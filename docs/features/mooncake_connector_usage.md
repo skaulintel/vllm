@@ -87,6 +87,12 @@ cache), see [ECMooncakeConnector Usage Guide](mooncake_ec_connector_usage.md).
     - Set the same value on prefill and decode instances. A decoder without it does not renew, so its requests that wait longer than the lease lose their prefilled KV; a prefiller without it rejects renewals, and the decoder logs a warning. Prefill instances from releases without this option log an error for each renewal they receive, so upgrade them before enabling it on decode instances.
 - **bootstrap_server_address**: Optional `"host:port"` of an already running Mooncake bootstrap server. All prefiller ranks register with this endpoint instead of launching an embedded server. The caller owns the server lifetime and must configure the proxy to use the same endpoint. The example proxy assumes the bootstrap server is on the prefiller API host; a different host requires a proxy that supplies that address in `remote_bootstrap_addr`. Omit this option to use the embedded server and `VLLM_MOONCAKE_BOOTSTRAP_PORT`.
 
+- **ssm_boundary_state_xfer**: Also send the Mamba state at the last full block of the prompt, so the decoder can reuse the transferred prefix from its own prefix cache. (default false)
+    - Only for hybrid Mamba/GDN models with prefix caching on (Mamba `align` cache mode). Enable it when a router may send a later turn to the decoder without a prefill instance (conditional disaggregation). Without it, the decoder recomputes the full prompt on such a turn.
+    - Set the same value on prefill and decode instances. The proxy hands both instances their parameters at once, so neither can tell the other whether it is on; both derive the boundary from the prompt length. If only the decoder enables it, its pulls fail with `P num blocks less than D`. If only the prefiller enables it, the extra state is dropped.
+    - Each prefill request holds one extra state block per Mamba group until its send completes. Ignored with decode context parallel (DCP > 1).
+    - Example: `--kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_connector_extra_config":{"ssm_boundary_state_xfer":true}}'`
+
 ## Prometheus metrics
 
 The following Prometheus metrics are exported when MooncakeConnector is active, each with the standard `model_name` and `engine` labels:
