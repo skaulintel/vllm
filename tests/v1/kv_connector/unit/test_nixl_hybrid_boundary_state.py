@@ -55,6 +55,8 @@ def _make_scheduler(
         mamba_cache_mode="align",
         num_blocks=200,
     )
+    # P-side truncation re-hashes the prompt (#64096).
+    kv_cache_config.hash_block_size = BLOCK_SIZE
     mamba_group = kv_cache_config.kv_cache_groups[MAMBA_GROUP]
     for i in range(1, num_mamba_groups):
         kv_cache_config.kv_cache_groups.append(
